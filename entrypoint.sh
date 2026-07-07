@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Mengambil environment variables atau menggunakan nilai default
-USER_NAME="${SSH_USER:-dd}"
-USER_PASS="${SSH_PASSWORD:-dd}"
+USER_NAME="${SSH_USER:-jatim}"
+USER_PASS="${SSH_PASSWORD:-jatim}"
 
 # Port PUBLIK (yang di-arahkan Railway TCP Proxy ke sini)
 PUBLIC_PORT="${PORT:-8080}"
@@ -12,7 +12,6 @@ SSL_INTERNAL_PORT="${SSL_INTERNAL_PORT:-2443}"
 WS_INTERNAL_PORT="${WS_INTERNAL_PORT:-8880}"
 
 echo "[*] Mengonfigurasi Server Message Dropbear (Banner Pra-Login)..."
-# Dropbear membaca teks murni, kita buat simpel tapi elegan
 cat << 'EOF' > /etc/dropbear_banner
 =================================================
              PREMIUM SSH SERVER DROPBEAR         
@@ -22,7 +21,6 @@ cat << 'EOF' > /etc/dropbear_banner
 EOF
 
 echo "[*] Mengonfigurasi Respon Server (Pasca-Login)..."
-# Skrip ini akan dieksekusi otomatis ketika user berhasil login
 cat << 'EOF' > /etc/profile.d/99-respon-server.sh
 #!/bin/bash
 clear
@@ -46,11 +44,9 @@ fi
 echo "$USER_NAME:$USER_PASS" | chpasswd
 
 echo "[*] Memulai Dropbear Server di Port Lokal 22..."
-# -p 127.0.0.1:22 = Hanya merespon internal (aman lewat proxy)
-# -b /etc/dropbear_banner = Memasang banner pra-login
-# -W 65536 = Trik premium memaksimalkan buffer size agar speed download ngacir
 /usr/sbin/dropbear -p 127.0.0.1:22 -b /etc/dropbear_banner -W 65536
 
+# --- PERBAIKAN FATAL: Mengubah accept ke 0.0.0.0 agar Cloudflare Tunnel Bisa Masuk ---
 echo "[*] Membuat konfigurasi Stunnel (internal) di Port $SSL_INTERNAL_PORT..."
 cat <<EOF > /etc/stunnel/stunnel.conf
 pid = /var/run/stunnel.pid
@@ -58,7 +54,7 @@ foreground = yes
 debug = 4
 
 [ssh-ssl]
-accept = 127.0.0.1:$SSL_INTERNAL_PORT
+accept = 0.0.0.0:$SSL_INTERNAL_PORT
 connect = 127.0.0.1:22
 cert = /etc/stunnel/stunnel.pem
 EOF
@@ -83,16 +79,33 @@ echo "[*] Memulai Stunnel (internal, port $SSL_INTERNAL_PORT)..."
 stunnel /etc/stunnel/stunnel.conf &
 
 echo "[*] Memulai WebSocket Proxy (internal, port $WS_INTERNAL_PORT, forward ke SSH 127.0.0.1:22)..."
-# Tetap mengarah ke 127.0.0.1:22 yang sekarang sudah diisi oleh Dropbear
 WS_PORT="$WS_INTERNAL_PORT" WS_TARGET_HOST="127.0.0.1" WS_TARGET_PORT="22" \
     python3 /usr/local/bin/ws-proxy.py &
 
-# --- Argo Tunnel (cloudflared), jalur tambahan khusus WS ---
-if [ -n "$CF_TUNNEL_TOKEN" ]; then
-    echo "[*] Menjalankan Cloudflare Tunnel (Argo) via token..."
-    cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" &
+# --- Argo Tunnel (cloudflared) via Ingress Rules ---
+if [ -n "$CF_TUNNEL_TOKEN" ] && [ -n "$CF_DOMAIN_WS" ] && [ -n "$CF_DOMAIN_SSL" ]; then
+    echo "[*] Membuat berkas konfigurasi Ingress Rules untuk Cloudflare..."
+    
+    mkdir -p /etc/cloudflared
+    
+    # noTLSVerify dipaksa true dari dalam kontainer agar bypass sertifikat lokal murni
+    cat <<EOF > /etc/cloudflared/config.yml
+tunnel: $CF_TUNNEL_TOKEN
+ingress:
+  - hostname: $CF_DOMAIN_WS
+    service: http://127.0.0.1:$WS_INTERNAL_PORT
+  - hostname: $CF_DOMAIN_SSL
+    service: https://127.0.0.1:$SSL_INTERNAL_PORT
+    originRequest:
+      originServerName: $CF_DOMAIN_SSL
+      noTLSVerify: true
+  - service: http_status:404
+EOF
+
+    echo "[*] Menjalankan Cloudflare Tunnel (Argo) via Ingress Config..."
+    cloudflared tunnel --config /etc/cloudflared/config.yml run &
 else
-    echo "[!] CF_TUNNEL_TOKEN tidak diset -> Cloudflare Tunnel dilewati."
+    echo "[!] Variabel Cloudflare belum lengkap (Butuh: CF_TUNNEL_TOKEN, CF_DOMAIN_WS, CF_DOMAIN_SSL) -> Argo Tunnel dilewati."
 fi
 
 echo "[*] Memulai Multiplexer di Port PUBLIK $PUBLIC_PORT (auto-deteksi SSL vs WS)..."
