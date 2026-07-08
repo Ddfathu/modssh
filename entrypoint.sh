@@ -15,9 +15,11 @@ echo "[*] Mengonfigurasi Server Message Dropbear (Banner Pra-Login)..."
 # Dropbear membaca teks murni, kita buat simpel tapi elegan
 cat << 'EOF' > /etc/dropbear_banner
 =================================================
+                  SELAMAT MENIKMATI
              PREMIUM SSH SERVER DROPBEAR         
 =================================================
-       Dilarang Torrent / DDOS / Hacking!        
+       Dilarang Torrent / DDOS / Hacking! 
+                 Powered By: dedefathu
 =================================================
 EOF
 
