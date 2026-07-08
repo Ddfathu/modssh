@@ -7,6 +7,9 @@ agar sinkron dengan mekanisme jabat tangan Dropbear SSH yang menggunakan
 custom banner, serta menyaring sisa payload enhanced PATCH dengan aman.
 Dituning khusus agar KEBAL terhadap payload super panjang (Anti 'too long line')
 dan dioptimalkan dengan High-Speed Header Parsing untuk koneksi kilat.
+
+[UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
+dengan suntikan Socket TCP Keepalive langsung di level aplikasi.
 """
 
 import asyncio
@@ -17,6 +20,7 @@ import os
 import signal
 import sys
 import secrets
+import socket
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -37,22 +41,16 @@ log = logging.getLogger("ws-proxy")
 
 
 def parse_headers(raw: bytes) -> dict:
-    """Fungsi pembaca header kecepatan tinggi (High-Speed Engine).
-    Hanya membaca bagian header HTTP, membuang sampah payload kosmetik di bawahnya
-    sehingga proses jabat tangan menjadi instan dan hemat CPU."""
+    """Fungsi pembaca header kecepatan tinggi (High-Speed Engine)."""
     headers = {}
     try:
-        # Potong tepat pada batas akhir header (\r\n\r\n), abaikan body di bawahnya
         header_part = raw.split(b"\r\n\r\n", 1)[0]
         lines = header_part.decode(errors="ignore").split("\r\n")
-        
-        # Iterasi mulai dari baris kedua (baris pertama adalah Request Method/Path)
         for line in lines[1:]:
             if not line:
                 continue
             if ":" in line:
                 k, v = line.split(":", 1)
-                # .strip() membersihkan spasi liar hantu akibat manipulasi HTTP Custom
                 headers[k.strip().lower()] = v.strip()
     except Exception as e:
         log.debug("Gagal parse header: %s", e)
@@ -77,7 +75,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         headers = parse_headers(raw_headers)
         raw_text_lower = raw_headers.decode(errors="ignore").lower()
 
-        # Cek tipe upgrade websocket secara presisi
         is_ws_upgrade = "upgrade: websocket" in raw_text_lower or headers.get("upgrade", "").lower() == "websocket"
 
         if is_ws_upgrade:
@@ -120,7 +117,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
-        # --- TUNING DROPBEAR FILTER: Memotong sisa teks HTTP PATCH tanpa merusak banner Dropbear ---
+        # --- TUNING DROPBEAR FILTER: Memotong sisa teks HTTP PATCH/POST Tanpa Bikin DC ---
         async def pipe_client_to_ssh(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             first_packet = True
             try:
@@ -130,16 +127,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         break
                     
                     if first_packet:
-                        first_packet = False
-                        # Jika paket pertama bocor membawa sampah HTTP mentah dari HTTP Custom
-                        if b"PATCH" in data or b"HTTP/" in data:
-                            # Bersihkan data kotor, cari apakah ada sisa data murni di belakangnya
-                            if b"SSH" in data:
-                                idx = data.find(b"SSH-")
-                                data = data[idx:]
-                            else:
-                                log.info("Membuang sisa data kotor HTTP dari paket awal client")
-                                continue
+                        # Cek secara presisi keberadaan banner SSH di dalam tumpukan payload
+                        if b"SSH-" in data:
+                            idx = data.find(b"SSH-")
+                            data = data[idx:]
+                            first_packet = False  # Handshake aman, matikan filter untuk sisa koneksi ini
+                        else:
+                            # Jika hanya berisi text manipulasi operator (PATCH/POST/HTTP), saring keluar
+                            log.info("Menyaring enhanced payload (sampah operator)...")
+                            continue
                     
                     dst.write(data)
                     await dst.drain()
@@ -187,10 +183,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    # 🔥 PENTING: Mengunci 'limit=8192' agar buffer kebal total dari payload super panjang
-    server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT, limit=8192)
+    # Fungsi internal untuk menyuntikkan TCP Keepalive langsung ke Socket level Container
+    def configure_socket(writer_spec):
+        sock = writer_spec.get_extra_info('socket')
+        if sock is not None:
+            # Aktifkan instruksi Keepalive dasar
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Tuning agresif: Cek tiap 15 detik, ulangi per 5 detik jika loss, drop setelah 3x gagal
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except AttributeError:
+                pass
+
+    # Menggunakan callback dinamis untuk menangkap transport socket client sebelum diproses
+    async def client_connected_cb(reader, writer):
+        configure_socket(writer)
+        await handle_client(reader, writer)
+
+    # Mengunci 'limit=8192' agar buffer kebal total dari payload super panjang
+    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=8192)
+    
     log.info(
-        "WS proxy jalan di %s:%s -> Dropbear Backend Active (High-Speed & Jumbo Payload Enabled)",
+        "WS proxy jalan di %s:%s -> Dropbear Backend Active (Railway Socket Tuning Enabled)",
         LISTEN_HOST, LISTEN_PORT,
     )
     async with server:
